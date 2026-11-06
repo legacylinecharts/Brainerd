@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Legacy Line Charts v62.4</title>
+    <title>Legacy Line Charts v63.4</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone@7.23.10/babel.min.js"></script>
@@ -463,6 +463,19 @@
         // ============================================================
         const SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS9f_dnbLuz_ssCdkcf1TX1MccYywmWMbY7xM5rcrpCqOrUMzWmf6b_vLRQvphj4w/pub?output=csv';
 
+        // ============================================================
+        // v63.0: LIVE SUBSCRIBER DATA — Apps Script Web App endpoint
+        // In SUBSCRIBER_MODE, the browser GET-hydrates team state from this
+        // endpoint on page load and POST-syncs changes back as the coach
+        // works. Per-team data lives in its own tab (name = EMBEDDED_CONFIG.siteId)
+        // of the "LLC Live Data" Google Sheet, backing the Apps Script. All sync
+        // is additive — if the fetch fails or the endpoint is unreachable, the
+        // app falls through to localStorage behavior with zero visible disruption.
+        // ============================================================
+        const LIVE_DATA_URL = 'https://script.google.com/macros/s/AKfycbwOdDeGH7rG6sKRiqIxhEVMpNVtQQQpoGu2Szq1lpA1D70k_PyO7xA6sVKUJsBq7G7V/exec';
+        const LIVE_DATA_DEBOUNCE_MS = 1500;
+        const LIVE_DATA_MAX_SECTION_BYTES = 45000;  // leave headroom under the 50K Sheets cell limit
+
         // Minimal CSV parser — handles quoted fields with embedded commas, escaped double-quotes ("")
         // and both \n and \r\n line endings. Strips UTF-8 BOM if present.
         const parseCsv = (text) => {
@@ -596,6 +609,60 @@
           if (!trimmed || trimmed === 'TBD') return raw;
           const found = lookupTeam(trimmed);
           return found && found.name ? found.name : raw;
+        };
+
+        // v62.6 / v63.1: fuzzy player match for parsePlayerStats. Rules (any of these is a match, ranked by priority):
+        //   1. Exact full-name match (case-insensitive) — the common case for Legacy Hockey data
+        //   2. Last name Levenshtein ≤ 2  AND  (first-name Lev ≤ 2  OR  one first name is a prefix of the other
+        //      OR same first 3 chars) — handles typos ("Anderson" ↔ "Andersen"), prefix-style nickname↔formal
+        //      pairs ("Jon" ↔ "Jonathan", "Alex" ↔ "Alexander"), and non-prefix nicknames like Nick ↔ Nicholas
+        //      (both "Nic") without false-matching siblings (Lance ↔ Daniel differ too much on firstName).
+        // Won't catch substitution nicknames (Mike ↔ Michael, Jake ↔ Jacob) — those produce a diagnosable
+        // "0 stats shown" failure that a coach fixes by making names consistent in Legacy Hockey.
+        // When multiple candidates match the fuzzy rule, the one with the lowest total edit distance wins.
+        // NUMBER IS NOT USED — jersey numbers change year-over-year, so matching on number breaks continuity
+        // (Lance Halonen #42 → #12 with brother Daniel having worn #12 before was the original breaking case).
+        const findRosterPlayerFuzzy = (candidates, cleanName, positionFilter) => {
+          if (!cleanName) return null;
+          const parts = cleanName.trim().split(/\s+/);
+          if (parts.length < 1) return null;
+          const inLast  = (parts.pop() || '').toLowerCase();
+          const inFirst = (parts.join(' ') || '').toLowerCase();
+          if (!inLast) return null;
+
+          // Priority 1: exact full-name match (ignore case + Capt./* decoration)
+          for (const p of candidates) {
+            if (positionFilter && !positionFilter(p)) continue;
+            const stored = (p.name || '').trim().toLowerCase();
+            const storedStripped = (p.name || '').replace(/\s*\(Capt\.?\)/i,'').replace(/\*/g,'').trim().toLowerCase();
+            if (stored === cleanName.trim().toLowerCase() || storedStripped === cleanName.trim().toLowerCase()) {
+              return p;
+            }
+          }
+
+          // Priority 2: fuzzy. lastName Lev ≤ 2 AND one of these on firstName:
+          //   • Lev ≤ 2 (small typos)
+          //   • one is a prefix of the other (Jon↔Jonathan, Alex↔Alexander, Will↔William)
+          //   • same first 3 chars (Nick↔Nicholas — not prefix because K vs H)
+          // Pick candidate with lowest total edit distance.
+          let best = null, bestDist = Infinity;
+          for (const p of candidates) {
+            if (positionFilter && !positionFilter(p)) continue;
+            const pLast  = (p.lastName  || '').toLowerCase();
+            const pFirst = (p.firstName || '').toLowerCase();
+            if (!pLast || !pFirst || !inFirst) continue;
+            const lastDist = levenshtein(pLast, inLast);
+            if (lastDist > 2) continue;
+            const firstDist = levenshtein(pFirst, inFirst);
+            const firstPrefix = pFirst.length >= 2 && inFirst.length >= 2 &&
+              (pFirst.startsWith(inFirst) || inFirst.startsWith(pFirst));
+            const first3Same  = pFirst.length >= 3 && inFirst.length >= 3 &&
+              pFirst.substring(0, 3) === inFirst.substring(0, 3);
+            if (firstDist > 2 && !firstPrefix && !first3Same) continue;
+            const total = lastDist + Math.min(firstDist, firstPrefix ? 1 : (first3Same ? 2 : firstDist));
+            if (total < bestDist) { bestDist = total; best = p; }
+          }
+          return best;
         };
 
         // Get sorted list of teams for dropdown
@@ -878,13 +945,25 @@
           const [showCareerStats, setShowCareerStats] = useState(false);
           const [showPronunciations, setShowPronunciations] = useState(false);
 
-          // v60.9: 3-goalie mode toggle (persisted to localStorage)
-          const [useThreeGoalies, setUseThreeGoalies] = useState(() => {
+          // v63.3: 3-goalie mode is now a 3-state string (replaces v60.9 boolean useThreeGoalies).
+          //   'STANDARD'          — 2 goalies, 12F / 6D, notes live in D3 right-column
+          //   'THREE_G_EJECT_F'   — 3 goalies, 11F / 6D (4th-line RW ejected to Available; notes move to Line 4 right-column; 3rd G takes D3 right-column)
+          //   'THREE_G_EJECT_D'   — 3 goalies, 12F / 5D (3rd-pair RD ejected to Available; notes move inline with D3 LD; 3rd G stays in D3 right-column)
+          // Backward-compat: migrates old 'hockey-scout-three-goalies' boolean key on first load.
+          const [goalieMode, setGoalieMode] = useState(() => {
             try {
-              const saved = localStorage.getItem('hockey-scout-three-goalies');
-              return saved === 'true';
-            } catch { return false; }
+              const savedNew = localStorage.getItem('hockey-scout-goalie-mode');
+              if (savedNew === 'STANDARD' || savedNew === 'THREE_G_EJECT_F' || savedNew === 'THREE_G_EJECT_D') return savedNew;
+              const savedOld = localStorage.getItem('hockey-scout-three-goalies');
+              return savedOld === 'true' ? 'THREE_G_EJECT_F' : 'STANDARD';
+            } catch { return 'STANDARD'; }
           });
+          // v63.3: dropdown open/close for the +3rd Goalie button menu
+          const [goalieMenuOpen, setGoalieMenuOpen] = useState(false);
+          // v63.3: derived booleans for render branches
+          const isThreeG = goalieMode !== 'STANDARD';
+          const isEjectF = goalieMode === 'THREE_G_EJECT_F';
+          const isEjectD = goalieMode === 'THREE_G_EJECT_D';
 
           // Stat display toggles - persisted to localStorage
           const [showPlusMinus, setShowPlusMinus] = useState(() => {
@@ -1228,10 +1307,14 @@
           useEffect(() => {
             try { localStorage.setItem('llc-show-pim', JSON.stringify(showPIM)); } catch {}
           }, [showPIM]);
-          // v60.9: persist 3-goalie mode preference
+          // v63.3: persist goalie-mode preference (replaces v60.9 boolean). Also clears the legacy
+          // boolean key the first time a user saves a new value, so the migration doesn't fire again.
           useEffect(() => {
-            try { localStorage.setItem('hockey-scout-three-goalies', useThreeGoalies ? 'true' : 'false'); } catch {}
-          }, [useThreeGoalies]);
+            try {
+              localStorage.setItem('hockey-scout-goalie-mode', goalieMode);
+              localStorage.removeItem('hockey-scout-three-goalies');
+            } catch {}
+          }, [goalieMode]);
           useEffect(() => {
             try { localStorage.setItem('hockey-scout-coachNotes', JSON.stringify(coachNotes)); } catch {}
           }, [coachNotes]);
@@ -1292,6 +1375,39 @@
                 MSHSL_TEAMS = parsed;
                 setTeamsDbReady(true);
                 console.log(`✅ Loaded live team DB from Google Sheet (${n} teams).`);
+
+                // v62.5: in SUBSCRIBER_MODE, after the live sheet loads, re-source the subscriber's
+                // OWN team logo + colors from the sheet by looking up their team name. This way a
+                // logo/color change in the Google Sheet shows up on the subscriber's site on the
+                // next page load — no rebuild needed. If the team isn't found in the sheet (or the
+                // fetch earlier failed and we never reached this line), the EMBEDDED_CONFIG baked-in
+                // values stay in place as the fallback. Only logo + colors are overridden — teamName,
+                // arena, careerStats, pronunciations, postHSInfo all remain from EMBEDDED_CONFIG /
+                // localStorage.
+                if (SUBSCRIBER_MODE) {
+                  try {
+                    const myName = myTeamSetup && myTeamSetup.teamName;
+                    if (myName) {
+                      const hit = lookupTeam(myName);
+                      if (hit && (hit.logo || hit.primaryColor || hit.secondaryColor)) {
+                        setMyTeamSetup(prev => ({
+                          ...prev,
+                          logo: hit.logo || prev.logo,
+                          colors: {
+                            ...(prev.colors || {}),
+                            primary: hit.primaryColor || prev.colors?.primary,
+                            secondary: hit.secondaryColor || prev.colors?.secondary
+                          }
+                        }));
+                        console.log(`🎨 Subscriber self-sync: refreshed logo and colors for "${myName}" from live sheet.`);
+                      } else {
+                        console.log(`ℹ️ Subscriber self-sync: no sheet entry matched "${myName}" — keeping embedded logo/colors.`);
+                      }
+                    }
+                  } catch (err) {
+                    console.warn('⚠️ Subscriber self-sync failed — keeping embedded logo/colors:', err && err.message);
+                  }
+                }
               } catch (e) {
                 console.warn('⚠️ Could not fetch live team DB — using baked-in fallback:', e && e.message);
               }
@@ -1300,7 +1416,150 @@
           }, []);
 
           // Helper Functions
-          
+
+          // v63.0: live-data sync infrastructure. Shared state + helper for all 5 sync useEffects.
+          // syncEnabledRef flips true after the hydration useEffect finishes (success or failure),
+          // so initial-render state-change-fires of the sync useEffects don't echo hydrated data
+          // back to the sheet. Each section (page1, lines, pronunciations, coachNotes, postHSInfo)
+          // has its own debounce timer so a flurry of changes in one section coalesces to one POST.
+          const syncEnabledRef = React.useRef(false);
+          const syncTimersRef  = React.useRef({});
+          const liveSlug = SUBSCRIBER_MODE ? (EMBEDDED_CONFIG?.siteId || '').trim().toLowerCase() : '';
+          const scheduleSync = React.useCallback((section, data) => {
+            if (!SUBSCRIBER_MODE || !liveSlug || !syncEnabledRef.current) return;
+            const timers = syncTimersRef.current;
+            if (timers[section]) clearTimeout(timers[section]);
+            timers[section] = setTimeout(async () => {
+              delete timers[section];
+              try {
+                const body = JSON.stringify({ team: liveSlug, patch: { [section]: data } });
+                if (body.length > LIVE_DATA_MAX_SECTION_BYTES && section === 'postHSInfo') {
+                  console.warn(`⚠️ Live sync skipped: ${section} payload is ${body.length} bytes (over ${LIVE_DATA_MAX_SECTION_BYTES} limit). Kept in localStorage only.`);
+                  return;
+                }
+                const res = await fetch(LIVE_DATA_URL, { method: 'POST', body });
+                const json = await res.json().catch(() => null);
+                if (json && json.ok) {
+                  console.log(`🔼 Live sync wrote ${section} (${body.length} bytes).`);
+                } else {
+                  console.warn(`⚠️ Live sync for ${section} returned error:`, json && json.error);
+                }
+              } catch (e) {
+                console.warn(`⚠️ Live sync for ${section} failed:`, e && e.message);
+              }
+            }, LIVE_DATA_DEBOUNCE_MS);
+          }, [liveSlug]);
+
+          // v63.0: hydration — on mount, in SUBSCRIBER_MODE, GET this team's live data from the sheet
+          // and apply each section to state. Only enables the sync useEffects AFTER this finishes
+          // (success OR failure), so sync doesn't echo hydrated data back on first render.
+          useEffect(() => {
+            if (!SUBSCRIBER_MODE || !liveSlug) {
+              syncEnabledRef.current = true;  // master site: no hydration, enable sync (which is a no-op anyway)
+              return;
+            }
+            let cancelled = false;
+            (async () => {
+              try {
+                const res = await fetch(`${LIVE_DATA_URL}?team=${encodeURIComponent(liveSlug)}`);
+                const json = await res.json();
+                if (cancelled) return;
+                if (!json || !json.ok) {
+                  console.warn('⚠️ Live hydration returned non-ok:', json && json.error);
+                  return;
+                }
+                const d = json.data || {};
+                if (d.page1) {
+                  if (d.page1.myTeamData)        setMyTeamData(prev => ({ ...prev, ...d.page1.myTeamData }));
+                  if (d.page1.opponentData)      setOpponentData(prev => ({ ...prev, ...d.page1.opponentData }));
+                  if (d.page1.opponentLogo)      setOpponentLogo(d.page1.opponentLogo);
+                  if (d.page1.opponentColors)    setOpponentColors(d.page1.opponentColors);
+                  if (d.page1.oppSpecialTeamsManual) setOppSpecialTeamsManual(d.page1.oppSpecialTeamsManual);
+                }
+                if (d.lines)                     setLines(prev => ({ ...prev, ...d.lines }));
+                if (d.pronunciations || d.postHSInfo) {
+                  setMyTeamSetup(prev => ({
+                    ...prev,
+                    ...(d.pronunciations ? { pronunciations: d.pronunciations } : {}),
+                    ...(d.postHSInfo ? { postHSInfo: d.postHSInfo } : {})
+                  }));
+                }
+                if (d.coachNotes) {
+                  setCoachNotes(prev => ({
+                    ...prev,
+                    pk:         d.coachNotes.pk         ?? prev.pk,
+                    pp:         d.coachNotes.pp         ?? prev.pp,
+                    pkTitle:    d.coachNotes.pkTitle    ?? prev.pkTitle,
+                    ppTitle:    d.coachNotes.ppTitle    ?? prev.ppTitle,
+                    scoutNotes: d.coachNotes.scoutNotes ?? prev.scoutNotes
+                  }));
+                }
+                // v63.3: hydrate goalieMode from sheet (validated whitelist; falls back to local value otherwise)
+                if (d.goalieMode === 'STANDARD' || d.goalieMode === 'THREE_G_EJECT_F' || d.goalieMode === 'THREE_G_EJECT_D') {
+                  setGoalieMode(d.goalieMode);
+                }
+                console.log(`🔽 Live hydration applied for "${liveSlug}" — sections:`, Object.keys(d).filter(k => !k.startsWith('_')));
+              } catch (e) {
+                console.warn('⚠️ Live hydration failed — using localStorage mirror:', e && e.message);
+              } finally {
+                if (!cancelled) syncEnabledRef.current = true;
+              }
+            })();
+            return () => { cancelled = true; };
+          }, [liveSlug]);
+
+          // v63.0: five sync useEffects — one per data slice. Each fires on its slice's state change,
+          // calls scheduleSync (which no-ops when syncEnabledRef is false, i.e. before hydration done).
+          // Debounced per-section so e.g. rapid line drag-drops coalesce into one POST.
+
+          // (1) page 1 data — my team + opponent headers, logos, colors, manual special teams
+          useEffect(() => {
+            scheduleSync('page1', {
+              myTeamData,
+              opponentData,
+              opponentLogo,
+              opponentColors,
+              oppSpecialTeamsManual
+            });
+          }, [myTeamData, opponentData, opponentLogo, opponentColors, oppSpecialTeamsManual, scheduleSync]);
+
+          // (2) lines — forward lines, D pairs, goalies (my team only; opponent lines stay local per scope)
+          useEffect(() => {
+            scheduleSync('lines', lines);
+          }, [lines, scheduleSync]);
+
+          // (3) pronunciations — key-value map, tiny data
+          useEffect(() => {
+            if (myTeamSetup && myTeamSetup.pronunciations) {
+              scheduleSync('pronunciations', myTeamSetup.pronunciations);
+            }
+          }, [myTeamSetup?.pronunciations, scheduleSync]);
+
+          // (4) coach notes — text content only (pk, pp, titles, scoutNotes). Toggles stay local.
+          useEffect(() => {
+            scheduleSync('coachNotes', {
+              pk:         coachNotes?.pk         || '',
+              pp:         coachNotes?.pp         || '',
+              pkTitle:    coachNotes?.pkTitle    || '',
+              ppTitle:    coachNotes?.ppTitle    || '',
+              scoutNotes: coachNotes?.scoutNotes || { powerPlay: '', penaltyKill: '', keyPlayers: '' }
+            });
+          }, [coachNotes?.pk, coachNotes?.pp, coachNotes?.pkTitle, coachNotes?.ppTitle, coachNotes?.scoutNotes, scheduleSync]);
+
+          // (5) Post-HS logos — base64 image blobs; scheduleSync enforces the per-cell size cap and
+          // falls back to localStorage-only when a team's logos exceed it.
+          useEffect(() => {
+            if (myTeamSetup && myTeamSetup.postHSInfo && Object.keys(myTeamSetup.postHSInfo).length > 0) {
+              scheduleSync('postHSInfo', myTeamSetup.postHSInfo);
+            }
+          }, [myTeamSetup?.postHSInfo, scheduleSync]);
+
+          // (6) v63.3: goalieMode — syncs the 3-goalie layout choice so a coach's F-eject or D-eject
+          // selection follows them across devices. Tiny payload (a single string).
+          useEffect(() => {
+            scheduleSync('goalieMode', goalieMode);
+          }, [goalieMode, scheduleSync]);
+
           // Compress image before storing in localStorage
           const compressImage = (file, maxWidth = 800, maxHeight = 800, quality = 0.7, fillWhiteBackground = false) => {
             return new Promise((resolve, reject) => {
@@ -2523,13 +2782,10 @@
                 const cleanName = (() => { const p = name.trim().split(/\s+/); const r = []; for (const t of p) { const tc = t.replace(/\*+$/, ''); if (/[a-z]$/.test(tc)) r.push(tc); else break; } return r.length > 0 ? r.join(' ') : p[0]; })();
 
                 if (inSkaterSection) {
-                  const player = updatedRoster.find(p =>
-                    p.number === number &&
-                    p.position !== 'G' &&
-                    (p.name === cleanName ||
-                     p.name.replace(/\s*\(Capt\.?\)/i,'').replace(/\*/g,'').trim() === cleanName ||
-                     p.lastName === cleanName.split(' ').pop())
-                  );
+                  // v63.1 (ported from v62.6): fuzzy match on name (no number). Handles jersey
+                  // number changes year-over-year and tolerates typos/prefix-nicknames. See
+                  // findRosterPlayerFuzzy for the full rules.
+                  const player = findRosterPlayerFuzzy(updatedRoster, cleanName, (p) => p.position !== 'G');
 
                   if (player && fields.length >= (6 + fieldOffset)) {
                     const currentStats = {
@@ -2582,13 +2838,9 @@
                   }
 
                 } else if (inGoalieSection) {
-                  const player = updatedRoster.find(p =>
-                    p.number === number &&
-                    p.position === 'G' &&
-                    (p.name === cleanName ||
-                     p.name.replace(/\s*\(Capt\.?\)/i,'').replace(/\*/g,'').trim() === cleanName ||
-                     p.lastName === cleanName.split(' ').pop())
-                  );
+                  // v63.1 (ported from v62.6): fuzzy match on name (no number). Same rules as the
+                  // skater branch, position filter switched to G.
+                  const player = findRosterPlayerFuzzy(updatedRoster, cleanName, (p) => p.position === 'G');
 
                   if (player && player.goalieStats && fields.length >= (10 + fieldOffset)) {
                     const currentGoalieStats = {
@@ -3153,6 +3405,36 @@
             } else if (position === 'third') {
               setLines({ ...lines, goalies: { ...lines.goalies, thirdColor: color } });
             }
+          };
+
+          // v63.3: switch between the three goalie-mode layouts. On each transition the slot that is
+          // about to disappear is ejected (set to null) so no player gets stranded off-chart. Slots
+          // that are being re-exposed (e.g. Line 4 RW when leaving F-eject) stay null — they're just
+          // visible again and ready for a drag-drop or Available-list click.
+          const applyGoalieMode = (next) => {
+            if (next === goalieMode) { setGoalieMenuOpen(false); return; }
+            setLines(prev => {
+              let out = prev;
+              if (next === 'STANDARD') {
+                // 3rd goalie slot disappears
+                if (out.goalies && out.goalies.third) {
+                  out = { ...out, goalies: { ...out.goalies, third: null } };
+                }
+              } else if (next === 'THREE_G_EJECT_F') {
+                // Line 4 RW slot disappears
+                if (out.line4 && out.line4.rw) {
+                  out = { ...out, line4: { ...out.line4, rw: null } };
+                }
+              } else if (next === 'THREE_G_EJECT_D') {
+                // D3 RD slot disappears
+                if (out.d3 && out.d3.rd) {
+                  out = { ...out, d3: { ...out.d3, rd: null } };
+                }
+              }
+              return out;
+            });
+            setGoalieMode(next);
+            setGoalieMenuOpen(false);
           };
 
           const convertGradeToText = (grade) => {
@@ -4878,34 +5160,73 @@
                         <span>{coachNotes.notesVisible ? 'ON' : 'OFF'}</span>
                       </div>
                     </button>
-                    <button
-                      onClick={() => {
-                        const turningOn = !useThreeGoalies;
-                        if (turningOn) {
-                          // Auto-eject Line 4 RW player (notes will take that slot's space)
-                          if (lines.line4 && lines.line4.rw) {
-                            setLines({ ...lines, line4: { ...lines.line4, rw: null } });
-                          }
-                        } else {
-                          // Auto-eject 3rd goalie back to Available
-                          if (lines.goalies && lines.goalies.third) {
-                            setLines({ ...lines, goalies: { ...lines.goalies, third: null } });
-                          }
+                    {/* v63.3: +3rd Goalie as a dropdown with 3 choices (STANDARD / EJECT_F / EJECT_D).
+                        Transition helper handles auto-ejecting the slot that is about to disappear so
+                        no stranded player is hidden off-chart. */}
+                    <div className="relative inline-block">
+                      <button
+                        onClick={() => setGoalieMenuOpen(!goalieMenuOpen)}
+                        className={`${isThreeG ? 'bg-amber-600 hover:bg-amber-700' : 'bg-gray-500 hover:bg-gray-600'} text-white px-3 py-1 rounded flex items-center gap-1 font-semibold`}
+                        style={{ lineHeight: '1.1' }}
+                        title={
+                          goalieMode === 'STANDARD'    ? '2-goalie mode (default). Click to choose a 3-goalie layout.' :
+                          goalieMode === 'THREE_G_EJECT_F' ? '3-goalie mode: 4th-line RW ejected (11F / 6D). Click to change.' :
+                                                            '3-goalie mode: 3rd-pair RD ejected (12F / 5D). Click to change.'
                         }
-                        setUseThreeGoalies(turningOn);
-                      }}
-                      className={`${useThreeGoalies ? 'bg-amber-600 hover:bg-amber-700' : 'bg-gray-500 hover:bg-gray-600'} text-white px-3 py-1 rounded flex items-center gap-1 font-semibold`}
-                      style={{ lineHeight: '1.1' }}
-                      title={useThreeGoalies
-                        ? '3-goalie mode is ON. Notes are in Line 4 area. Click to revert to 2 goalies.'
-                        : '2-goalie mode (default). Click to add a 3rd goalie slot — Line 4 RW will move to Available, notes will relocate to Line 4 area.'}
-                    >
-                      <span style={{ fontSize: '14px' }}>🥅</span>
-                      <div className="flex flex-col items-start" style={{ fontSize: '10px' }}>
-                        <span>{useThreeGoalies ? '3 Goalies' : '+3rd'}</span>
-                        <span>{useThreeGoalies ? 'ON' : 'Goalie'}</span>
-                      </div>
-                    </button>
+                      >
+                        <span style={{ fontSize: '14px' }}>🥅</span>
+                        <div className="flex flex-col items-start" style={{ fontSize: '10px' }}>
+                          <span>{goalieMode === 'STANDARD' ? '+3rd' : (isEjectF ? '3G: F' : '3G: D')}</span>
+                          <span>{goalieMode === 'STANDARD' ? 'Goalie ▾' : 'Eject ▾'}</span>
+                        </div>
+                      </button>
+                      {goalieMenuOpen && (
+                        <>
+                          {/* click-outside backdrop (click anywhere else closes menu) */}
+                          <div
+                            className="fixed inset-0"
+                            style={{ zIndex: 40 }}
+                            onClick={() => setGoalieMenuOpen(false)}
+                          ></div>
+                          {/* v63.4: dropdown items styled as mini toolbar buttons — same font weight, white
+                              text, goalie icon, amber family. Gray row = 2-goalie (matches parent-off),
+                              amber rows = 3-goalie (matches parent-on). Active row renders in the darker
+                              -700 shade with a check; inactive rows sit in -500 and hover to -600. */}
+                          <div
+                            className="absolute right-0 rounded shadow-lg overflow-hidden"
+                            style={{ top: '100%', marginTop: '4px', minWidth: '240px', zIndex: 50 }}
+                          >
+                            <button
+                              onClick={() => applyGoalieMode('STANDARD')}
+                              className={`w-full flex items-center gap-2 px-3 py-2 font-semibold text-white ${goalieMode === 'STANDARD' ? 'bg-gray-700' : 'bg-gray-500 hover:bg-gray-600'}`}
+                              style={{ lineHeight: '1.1' }}
+                            >
+                              <span style={{ fontSize: '14px' }}>🥅</span>
+                              <span style={{ fontSize: '12px', flex: 1, textAlign: 'left' }}>2 Goalies (12 F &amp; 6 D)</span>
+                              {goalieMode === 'STANDARD' && <span style={{ fontSize: '14px' }}>✓</span>}
+                            </button>
+                            <button
+                              onClick={() => applyGoalieMode('THREE_G_EJECT_F')}
+                              className={`w-full flex items-center gap-2 px-3 py-2 font-semibold text-white ${isEjectF ? 'bg-amber-700' : 'bg-amber-500 hover:bg-amber-600'}`}
+                              style={{ lineHeight: '1.1' }}
+                            >
+                              <span style={{ fontSize: '14px' }}>🥅</span>
+                              <span style={{ fontSize: '12px', flex: 1, textAlign: 'left' }}>3 Goalies (11 F &amp; 6 D)</span>
+                              {isEjectF && <span style={{ fontSize: '14px' }}>✓</span>}
+                            </button>
+                            <button
+                              onClick={() => applyGoalieMode('THREE_G_EJECT_D')}
+                              className={`w-full flex items-center gap-2 px-3 py-2 font-semibold text-white ${isEjectD ? 'bg-amber-700' : 'bg-amber-500 hover:bg-amber-600'}`}
+                              style={{ lineHeight: '1.1' }}
+                            >
+                              <span style={{ fontSize: '14px' }}>🥅</span>
+                              <span style={{ fontSize: '12px', flex: 1, textAlign: 'left' }}>3 Goalies (12 F &amp; 5 D)</span>
+                              {isEjectD && <span style={{ fontSize: '14px' }}>✓</span>}
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
                     <button onClick={() => {
                       const originalTitle = document.title;
                       try {
@@ -5303,8 +5624,9 @@
                       </div>
                     </div>
                   ))}
-                  {/* Line 4 — conditional: 2-goalie mode = standard 3 forward slots; 3-goalie mode = LW + C + notes (RW slot taken by notes) */}
-                  {!useThreeGoalies ? (
+                  {/* Line 4 — v63.3: 3-slot (LW+C+RW) in STANDARD and D-eject modes; 2-slot (LW+C) + notes only in F-eject.
+                      D-eject keeps all 12 forwards on-chart; its layout surgery happens in the D3 row below. */}
+                  {!isEjectF ? (
                     <div key="line4" className={`mb-1 rounded p-0 border-2 ${colorClasses[lines.line4.color]}`}>
                       <div className="flex items-center gap-0 mb-0">
                         <ColorPicker value={lines.line4.color} onChange={(c) => handleLineColorChange('line4', c)} />
@@ -5450,94 +5772,115 @@
                     </div>
                   </div>
 
-                  {/* D3 + PK/PP */}
+                  {/* D3 row — v63.3: three layouts selected by goalieMode.
+                      STANDARD: [LD+RD col-span-2]  + [Notes 2-cell 1/3]
+                      EJECT_F:  [LD+RD col-span-2]  + [3rd Goalie 1/3]
+                      EJECT_D:  [LD alone 1/3] + [Notes 2-cell 1/3] + [3rd Goalie 1/3]
+                      JSX constants factor the shared pieces so each branch stays one line. */}
                   <div className="grid grid-cols-3 gap-1 mb-1">
-                    <div className={`col-span-2 rounded p-0 border-2 ${colorClasses[lines.d3.color]}`}>
-                      <div className="flex items-center gap-0">
-                        <ColorPicker value={lines.d3.color} onChange={(c) => handleLineColorChange('d3', c)} />
-                        <div className="flex-1 grid grid-cols-2 gap-1">
-                          <LineSlot line="d3" position="ld" label="LD" showLabel={false} />
-                          <LineSlot line="d3" position="rd" label="RD" showLabel={false} />
-                        </div>
-                      </div>
-                    </div>
-                    {!useThreeGoalies ? (
-                      <div className={`grid grid-cols-2 gap-2 ${!coachNotes.notesVisible ? 'notes-text-hidden' : ''}`} style={{ height: '85px' }}>
-                        <div className="border-2 rounded flex flex-col" style={{ 
-                          borderColor: myTeamSetup.colors.primary, 
-                          background: `${myTeamSetup.colors.primary}10`,
-                          padding: '2px'
-                        }}>
-                          <input
-                            type="text"
-                            value={coachNotes.pkTitle || ''}
-                            placeholder="Add Notes"
-                            onChange={(e) => setCoachNotes({...coachNotes, pkTitle: e.target.value})}
-                            className="w-full border-0 bg-transparent text-center font-bold placeholder-print-hide"
-                            style={{ fontSize: '10px', padding: '0px', outline: 'none', marginBottom: '0px' }}
-                          />
-                          <div className="flex-1 flex flex-col justify-around" style={{ fontSize: '9px', lineHeight: '1.0' }}>
-                            {[0,1,2,3,4].map(i => (
-                              <input 
-                                key={i}
-                                type="text" 
-                                placeholder="" 
-                                className="w-full border-0 bg-transparent text-center"
-                                style={{ fontSize: '9px', padding: '0px', outline: 'none', fontWeight: 'normal' }}
-                                value={coachNotes.pk?.split('\n')[i] || ''}
-                                onChange={(e) => {
-                                  const pkLines = coachNotes.pk?.split('\n') || ['','','','',''];
-                                  pkLines[i] = e.target.value;
-                                  setCoachNotes({...coachNotes, pk: pkLines.join('\n')});
-                                }}
-                              />
-                            ))}
+                    {(() => {
+                      const notesTwoCell = (
+                        <div className={`grid grid-cols-2 gap-2 ${!coachNotes.notesVisible ? 'notes-text-hidden' : ''}`} style={{ height: '85px' }}>
+                          <div className="border-2 rounded flex flex-col" style={{
+                            borderColor: myTeamSetup.colors.primary,
+                            background: `${myTeamSetup.colors.primary}10`,
+                            padding: '2px'
+                          }}>
+                            <input
+                              type="text"
+                              value={coachNotes.pkTitle || ''}
+                              placeholder="Add Notes"
+                              onChange={(e) => setCoachNotes({...coachNotes, pkTitle: e.target.value})}
+                              className="w-full border-0 bg-transparent text-center font-bold placeholder-print-hide"
+                              style={{ fontSize: '10px', padding: '0px', outline: 'none', marginBottom: '0px' }}
+                            />
+                            <div className="flex-1 flex flex-col justify-around" style={{ fontSize: '9px', lineHeight: '1.0' }}>
+                              {[0,1,2,3,4].map(i => (
+                                <input
+                                  key={i}
+                                  type="text"
+                                  placeholder=""
+                                  className="w-full border-0 bg-transparent text-center"
+                                  style={{ fontSize: '9px', padding: '0px', outline: 'none', fontWeight: 'normal' }}
+                                  value={coachNotes.pk?.split('\n')[i] || ''}
+                                  onChange={(e) => {
+                                    const pkLines = coachNotes.pk?.split('\n') || ['','','','',''];
+                                    pkLines[i] = e.target.value;
+                                    setCoachNotes({...coachNotes, pk: pkLines.join('\n')});
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          </div>
+
+                          <div className="border-2 rounded flex flex-col" style={{
+                            borderColor: myTeamSetup.colors.primary,
+                            background: `${myTeamSetup.colors.primary}10`,
+                            padding: '2px'
+                          }}>
+                            <input
+                              type="text"
+                              value={coachNotes.ppTitle || ''}
+                              placeholder="Add Notes"
+                              onChange={(e) => setCoachNotes({...coachNotes, ppTitle: e.target.value})}
+                              className="w-full border-0 bg-transparent text-center font-bold placeholder-print-hide"
+                              style={{ fontSize: '10px', padding: '0px', outline: 'none', marginBottom: '0px' }}
+                            />
+                            <div className="flex-1 flex flex-col justify-around" style={{ fontSize: '9px', lineHeight: '1.0' }}>
+                              {[0,1,2,3,4].map(i => (
+                                <input
+                                  key={i}
+                                  type="text"
+                                  placeholder=""
+                                  className="w-full border-0 bg-transparent text-center"
+                                  style={{ fontSize: '9px', padding: '0px', outline: 'none', fontWeight: 'normal' }}
+                                  value={coachNotes.pp?.split('\n')[i] || ''}
+                                  onChange={(e) => {
+                                    const ppLines = coachNotes.pp?.split('\n') || ['','','','',''];
+                                    ppLines[i] = e.target.value;
+                                    setCoachNotes({...coachNotes, pp: ppLines.join('\n')});
+                                  }}
+                                />
+                              ))}
+                            </div>
                           </div>
                         </div>
-                        
-                        <div className="border-2 rounded flex flex-col" style={{ 
-                          borderColor: myTeamSetup.colors.primary, 
-                          background: `${myTeamSetup.colors.primary}10`,
-                          padding: '2px'
-                        }}>
-                          <input
-                            type="text"
-                            value={coachNotes.ppTitle || ''}
-                            placeholder="Add Notes"
-                            onChange={(e) => setCoachNotes({...coachNotes, ppTitle: e.target.value})}
-                            className="w-full border-0 bg-transparent text-center font-bold placeholder-print-hide"
-                            style={{ fontSize: '10px', padding: '0px', outline: 'none', marginBottom: '0px' }}
-                          />
-                          <div className="flex-1 flex flex-col justify-around" style={{ fontSize: '9px', lineHeight: '1.0' }}>
-                            {[0,1,2,3,4].map(i => (
-                              <input 
-                                key={i}
-                                type="text" 
-                                placeholder="" 
-                                className="w-full border-0 bg-transparent text-center"
-                                style={{ fontSize: '9px', padding: '0px', outline: 'none', fontWeight: 'normal' }}
-                                value={coachNotes.pp?.split('\n')[i] || ''}
-                                onChange={(e) => {
-                                  const ppLines = coachNotes.pp?.split('\n') || ['','','','',''];
-                                  ppLines[i] = e.target.value;
-                                  setCoachNotes({...coachNotes, pp: ppLines.join('\n')});
-                                }}
-                              />
-                            ))}
+                      );
+                      const thirdGoalieCard = (
+                        <div className={`goalie-card-extended rounded p-0 border-2 ${colorClasses[lines.goalies.thirdColor]}`} style={{ width: 'calc(100% + 28px)' }}>
+                          <div className="flex items-center gap-0">
+                            <div className="flex-1" style={{ minWidth: 0 }}>
+                              <LineSlot line="goalies" position="third" label="3rd" showLabel={false} />
+                            </div>
+                            <ColorPicker value={lines.goalies.thirdColor} onChange={(c) => handleGoalieColorChange('third', c)} />
                           </div>
                         </div>
-                      </div>
-                    ) : (
-                      /* v60.9: 3rd goalie slot — replaces notes container in 3-goalie mode. Mirrors starter/backup goalie card structure. */
-                      <div className={`goalie-card-extended rounded p-0 border-2 ${colorClasses[lines.goalies.thirdColor]}`} style={{ width: 'calc(100% + 28px)' }}>
-                        <div className="flex items-center gap-0">
-                          <div className="flex-1" style={{ minWidth: 0 }}>
-                            <LineSlot line="goalies" position="third" label="3rd" showLabel={false} />
+                      );
+                      const d3PairFull = (
+                        <div className={`col-span-2 rounded p-0 border-2 ${colorClasses[lines.d3.color]}`}>
+                          <div className="flex items-center gap-0">
+                            <ColorPicker value={lines.d3.color} onChange={(c) => handleLineColorChange('d3', c)} />
+                            <div className="flex-1 grid grid-cols-2 gap-1">
+                              <LineSlot line="d3" position="ld" label="LD" showLabel={false} />
+                              <LineSlot line="d3" position="rd" label="RD" showLabel={false} />
+                            </div>
                           </div>
-                          <ColorPicker value={lines.goalies.thirdColor} onChange={(c) => handleGoalieColorChange('third', c)} />
                         </div>
-                      </div>
-                    )}
+                      );
+                      const d3LdSolo = (
+                        <div className={`rounded p-0 border-2 ${colorClasses[lines.d3.color]}`}>
+                          <div className="flex items-center gap-0">
+                            <ColorPicker value={lines.d3.color} onChange={(c) => handleLineColorChange('d3', c)} />
+                            <div className="flex-1">
+                              <LineSlot line="d3" position="ld" label="LD" showLabel={false} />
+                            </div>
+                          </div>
+                        </div>
+                      );
+                      if (goalieMode === 'THREE_G_EJECT_F') return (<>{d3PairFull}{thirdGoalieCard}</>);
+                      if (goalieMode === 'THREE_G_EJECT_D') return (<>{d3LdSolo}{notesTwoCell}{thirdGoalieCard}</>);
+                      /* STANDARD */                        return (<>{d3PairFull}{notesTwoCell}</>);
+                    })()}
                   </div>
                 </div>
 
